@@ -26,7 +26,7 @@ This project is a Laravel-based web application designed to manage and store var
 - Automaticaly check active networks
 
 ## Preview
-![Alt text](assets/images/your-image.png)
+![smaple screeshoot](assets/images/your-image.png)
 
 
 ## Installation
