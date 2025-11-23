@@ -1,4 +1,4 @@
-name: Laravel
+name: Laravel CI & Deploy to cPanel (SSH)
 
 on:
   push:
@@ -7,29 +7,107 @@ on:
     branches: [ "main" ]
 
 jobs:
-  laravel-tests:
-
+  build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      PHP_CMD: ${{ secrets.CPANEL_PHP_PATH }}  # Optional: set on repo secrets if needed
 
     steps:
-    - uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.0'
-    - uses: actions/checkout@v3
-    - name: Copy .env
-      run: php -r "file_exists('.env') || copy('.env.example', '.env');"
-    - name: Install Dependencies
-      run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
-    - name: Generate key
-      run: php artisan key:generate
-    - name: Directory Permissions
-      run: chmod -R 777 storage bootstrap/cache
-    - name: Create Database
-      run: |
-        mkdir -p database
-        touch database/database.mysql
-    - name: Execute tests (Unit and Feature tests) via PHPUnit/Pest
-      env:
-        DB_CONNECTION: mysql
-        DB_DATABASE: database/database.mysql
-      run: php artisan test
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.0'
+          extensions: mbstring, pdo, pdo_mysql, tokenizer, xml, ctype, json
+
+      - name: Copy .env for CI
+        run: php -r "file_exists('.env') || copy('.env.example', '.env');"
+
+      - name: Install Composer dependencies (no dev)
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Create DB file for tests
+        run: |
+          mkdir -p database
+          touch database/database.sqlite
+
+      - name: Run tests
+        env:
+          DB_CONNECTION: sqlite
+          DB_DATABASE: database/database.sqlite
+        run: php artisan test
+
+      - name: Prepare deployment archive
+        # We exclude .env to avoid overwriting server config. Include vendor for servers without composer.
+        run: |
+          tar --exclude='./.git' \
+              --exclude='./node_modules' \
+              --exclude='./storage/logs/*' \
+              --exclude='./storage/framework/cache/data/*' \
+              --exclude='./storage/framework/sessions/*' \
+              --exclude='./.github' \
+              --exclude='./deploy.tar.gz' \
+              --exclude='./.env' \
+              -czf deploy.tar.gz .
+
+      - name: Start ssh-agent and add private key
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.CPANEL_SSH_KEY }}
+
+      - name: Upload archive to server (SCP)
+        uses: appleboy/scp-action@v0.1.5
+        with:
+          host: ${{ secrets.CPANEL_HOST }}
+          username: ${{ secrets.CPANEL_USER }}
+          port: ${{ secrets.CPANEL_PORT }}
+          source: "deploy.tar.gz"
+          target: ${{ secrets.CPANEL_PATH }}
+
+      - name: Extract and finalize on server via SSH
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.CPANEL_HOST }}
+          username: ${{ secrets.CPANEL_USER }}
+          port: ${{ secrets.CPANEL_PORT }}
+          # The `key` is provided by ssh-agent started earlier; do not pass it here.
+          script: |
+            set -e
+            cd "${{ secrets.CPANEL_PATH }}"
+            # extract files from the uploaded tarball (it will overwrite current files with new ones)
+            tar -xzf deploy.tar.gz
+            rm deploy.tar.gz
+
+            # ensure storage & cache dirs exist
+            mkdir -p storage bootstrap/cache
+            chmod -R 775 storage bootstrap/cache || true
+
+            # if server has php-cli and you want to run migrations & caches:
+            # Set PHP binary: use env PHP_CMD if set, else fallback to "php"
+            PHP_BIN="${{ env.PHP_CMD }}"
+            if [ -z "$PHP_BIN" ]; then
+              PHP_BIN=php
+            fi
+
+            # Dump optimized autoload (vendor exists if we uploaded it)
+            if command -v "$PHP_BIN" >/dev/null 2>&1; then
+              # clear & rebuild caches and (optionally) run migrations
+              $PHP_BIN artisan config:clear || true
+              $PHP_BIN artisan route:clear || true
+              $PHP_BIN artisan view:clear || true
+
+              $PHP_BIN artisan config:cache || true
+              $PHP_BIN artisan route:cache || true
+              $PHP_BIN artisan view:cache || true
+
+              # optional: run migrations (uncomment if desired and be careful on production)
+              # $PHP_BIN artisan migrate --force
+            else
+              echo "PHP CLI not found on server; skipping artisan commands."
+            fi
+
+            # Final permissions (best-effort)
+            chmod -R 775 storage bootstrap/cache || true
+            echo "Deployment completed."
